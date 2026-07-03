@@ -1,0 +1,16 @@
+version = 0.1
+
+# Reference only. The supported deploy path is scripts/deploy.sh, which reads
+# secrets from scripts/.env (gitignored), packages the portal Lambda, and
+# deploys. This file just documents the parameters for anyone using `sam deploy`.
+
+[default.deploy.parameters]
+stack_name = "governed-gateway"
+resolve_s3 = true
+capabilities = "CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
+region = "eu-west-1"
+
+parameter_overrides = [
+  "GithubClientId=REPLACE_ME",
+  "GithubClientSecret=REPLACE_ME",
+]

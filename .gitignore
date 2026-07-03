@@ -1,0 +1,9 @@
+samconfig.toml
+.mcp.json
+.aws-sam/
+*.env
+!*.env.example
+.packaged.yaml
+__pycache__/
+*.pyc
+.pytest_cache/

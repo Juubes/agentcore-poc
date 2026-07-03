@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "governed-gateway": {
+      "type": "http",
+      "url": "<GatewayUrl stack output>",
+      "oauth": {
+        "clientId": "<UserPoolClientId stack output>",
+        "callbackPort": 8080,
+        "authServerMetadataUrl": "<AuthServerMetadataUrl stack output>"
+      }
+    }
+  }
+}

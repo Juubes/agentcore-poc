@@ -1,0 +1,539 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Governed AI-tool gateway on Amazon Bedrock AgentCore. A corporate IdP (Cognito)
+  authenticates the caller; a request interceptor forwards that verified identity to an
+  internal API, which authorizes per-user on IdP group claims. Single auditable entry
+  point for any MCP client. Also includes GitHub as a third-party-SaaS (3LO) example.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: governed-gateway
+    AllowedPattern: "^[a-zA-Z0-9-]{1,40}$"
+
+  GithubClientId:
+    Type: String
+    Description: GitHub OAuth App client id (the third-party-SaaS example target).
+  GithubClientSecret:
+    Type: String
+    NoEcho: true
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-users"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub "${ProjectName}-${AWS::AccountId}"
+
+  # Cognito serves no RFC 8414 authorization-server metadata (the /.well-known/
+  # oauth-authorization-server path 400s), and its OIDC discovery advertises
+  # token_endpoint_auth_methods_supported without "none" and omits
+  # code_challenge_methods_supported — neither usable by a public + PKCE MCP client.
+  # This bucket holds a corrected authorization-server metadata document that MCP
+  # clients read via oauth.authServerMetadataUrl. Public read, no secrets. See
+  # scripts/publish-oauth-metadata.sh.
+  MetadataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${AWS::AccountId}-oauth"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+  MetadataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MetadataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadMetadata
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${MetadataBucket.Arn}/oauth-authorization-server.json"
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-client"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - profile
+        - email
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - http://localhost:8080/callback
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-gateway-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: outbound-token-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WorkloadAndResourceTokens
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+                  - bedrock-agentcore:GetResourceOauth2Token
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/*"
+              - Sid: ReadProviderSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!*"
+              - Sid: InvokeInterceptor
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-interceptor"
+              - Sid: InvokeInternalApi
+                Effect: Allow
+                Action: execute-api:Invoke
+                Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${InternalHttpApi}/*"
+
+  GithubOAuthProvider:
+    Type: AWS::BedrockAgentCore::OAuth2CredentialProvider
+    Properties:
+      Name: !Sub "${ProjectName}-github"
+      CredentialProviderVendor: GithubOauth2
+      Oauth2ProviderConfigInput:
+        GithubOauth2ProviderConfig:
+          ClientId: !Ref GithubClientId
+          ClientSecret: !Ref GithubClientSecret
+
+  Gateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Ref ProjectName
+      Description: Single governed entry point for AI tools reaching internal systems.
+      RoleArn: !GetAtt GatewayRole.Arn
+      ProtocolType: MCP
+      ProtocolConfiguration:
+        Mcp:
+          SupportedVersions:
+            - "2025-11-25"
+      ExceptionLevel: DEBUG # only for dev env
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration"
+          AllowedClients:
+            - !Ref UserPoolClient
+            - !Ref PortalClient
+
+  GithubTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      Name: github
+      GatewayIdentifier: !Ref Gateway
+      Description: Read-only listing of the caller's GitHub repositories.
+      CredentialProviderConfigurations:
+        - CredentialProviderType: OAUTH
+          CredentialProvider:
+            OauthCredentialProvider:
+              ProviderArn: !GetAtt GithubOAuthProvider.CredentialProviderArn
+              GrantType: AUTHORIZATION_CODE
+              # After the user consents, AgentCore returns the browser here — the
+              # connections portal's callback — which finalizes the token binding
+              # (CompleteResourceTokenAuth). See the Portal* resources below.
+              DefaultReturnUrl: !Sub "https://${PortalApi}.execute-api.${AWS::Region}.amazonaws.com/connections/callback"
+              Scopes:
+                - repo
+      TargetConfiguration:
+        Mcp:
+          OpenApiSchema:
+            InlinePayload: |
+              openapi: 3.0.3
+              info:
+                title: GitHub read-only repositories
+                version: "1.0.0"
+              servers:
+                - url: https://api.github.com
+              paths:
+                /user/repos:
+                  get:
+                    operationId: listMyRepositories
+                    summary: List the signed-in user's repositories (names only)
+                    description: >
+                      Returns repositories the signed-in user can access, including
+                      private ones. Read-only.
+                    parameters:
+                      - name: visibility
+                        in: query
+                        required: false
+                        schema:
+                          type: string
+                          enum: [all, public, private]
+                          default: all
+                      - name: sort
+                        in: query
+                        required: false
+                        schema:
+                          type: string
+                          enum: [created, updated, pushed, full_name]
+                          default: full_name
+                      - name: per_page
+                        in: query
+                        required: false
+                        schema:
+                          type: integer
+                          default: 30
+                          maximum: 100
+                    responses:
+                      "200":
+                        description: A list of repositories.
+                        content:
+                          application/json:
+                            schema:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  name: { type: string }
+                                  full_name: { type: string }
+                                  private: { type: boolean }
+                                  html_url: { type: string }
+                    security:
+                      - githubOAuth: []
+              components:
+                securitySchemes:
+                  githubOAuth:
+                    type: http
+                    scheme: bearer
+
+  EngineeringGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: engineering
+      UserPoolId: !Ref UserPool
+  FinanceGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: finance
+      UserPoolId: !Ref UserPool
+
+  # HTTP API in front of the internal system, locked to IAM auth (AWS_IAM on the
+  # route): only a caller that SigV4-signs with an allowed IAM role reaches it. The
+  # gateway target uses a GATEWAY_IAM_ROLE credential, so the gateway is that caller —
+  # the backend is NOT reachable from the public internet with a spoofed header.
+  InternalHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-internal"
+      ProtocolType: HTTP
+  InternalApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref InternalHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt InternalApiFn.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: "2.0"
+  InternalApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref InternalHttpApi
+      RouteKey: "GET /internal/{collection}"
+      AuthorizationType: AWS_IAM
+      Target: !Sub "integrations/${InternalApiIntegration}"
+  InternalApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref InternalHttpApi
+      StageName: "$default"
+      AutoDeploy: true
+  InternalApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InternalApiFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${InternalHttpApi}/*/*/internal/{collection}"
+
+  # Mock internal system: authorizes per request on the caller's IdP groups, read
+  # from the interceptor-forwarded X-User-Token (see src/internal_api/).
+  InternalApiFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-internal-api"
+      Runtime: python3.12
+      Handler: internal_api.handler
+      CodeUri: src/internal_api/
+      Timeout: 10
+      MemorySize: 128
+      # Wired to InternalHttpApi via InternalApiIntegration/Route above (not a SAM
+      # HttpApi event) so the route can enforce AWS_IAM authorization.
+
+  # REQUEST: forwards the caller's validated JWT to internal-api targets.
+  # RESPONSE: rewrites un-onboarded 3LO elicitations to the portal (see
+  # src/interceptor/). Attached out-of-band by scripts/attach-interceptor.sh —
+  # interceptors are an update-gateway concern, not a CloudFormation property.
+  InterceptorFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-interceptor"
+      Runtime: python3.12
+      Handler: interceptor.handler
+      CodeUri: src/interceptor/
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          # Where to send users who hit an un-onboarded 3LO tool (RESPONSE path).
+          PORTAL_URL: !Sub "https://${PortalApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  InterceptorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InterceptorFn
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  InternalApiTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      Name: internal-api
+      GatewayIdentifier: !Ref Gateway
+      Description: Mock internal system; returns records scoped to the caller's IdP group.
+      # Allow the interceptor-injected identity header through to the target.
+      MetadataConfiguration:
+        AllowedRequestHeaders:
+          - X-User-Token
+      # GATEWAY_IAM_ROLE: the gateway SigV4-signs the outbound call, satisfying the
+      # internal API's IAM authorizer (see InternalHttpApi above).
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+          CredentialProvider:
+            IamCredentialProvider:
+              Service: execute-api
+      TargetConfiguration:
+        Mcp:
+          OpenApiSchema:
+            InlinePayload: !Sub |
+              openapi: 3.0.3
+              info:
+                title: Internal knowledge & records API
+                version: "1.0.0"
+              servers:
+                - url: https://${InternalHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+              paths:
+                /internal/documents:
+                  get:
+                    operationId: listDocuments
+                    summary: List internal documents the caller may read
+                    responses:
+                      "200": { description: OK }
+                /internal/tickets:
+                  get:
+                    operationId: listTickets
+                    summary: List tickets the caller may read
+                    responses:
+                      "200": { description: OK }
+                /internal/employees:
+                  get:
+                    operationId: listEmployees
+                    summary: List employee records the caller may read
+                    responses:
+                      "200": { description: OK }
+                /internal/customers:
+                  get:
+                    operationId: listCustomers
+                    summary: List customer records the caller may read
+                    responses:
+                      "200": { description: OK }
+
+  # --- Connections portal -----------------------------------------------------
+  # Self-service onboarding for per-user third-party 3LO (GitHub here). A user
+  # signs in with the corporate IdP, and the portal drives the gateway's own 3LO
+  # flow to consent + finalize, so the token vaults under the GATEWAY's workload
+  # identity and every later gateway call for that user is served. This is the
+  # only way that works: the token vault is workload-scoped and the gateway's
+  # workload identity is service-linked (un-borrowable), so a portal cannot vault
+  # a usable token under its own identity — it must finalize a gateway-initiated
+  # session. See README and src/portal/app.py.
+
+  # Separate Cognito app client for the portal's browser login (hosted UI, PKCE,
+  # public client — no secret in the Lambda).
+  PortalClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-portal"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - profile
+        - email
+      SupportedIdentityProviders:
+        - COGNITO
+      # Placeholder callback; scripts/deploy.sh rewrites this to the real portal URL
+      # post-deploy. It can't reference PortalApi here (PortalFn -> PortalClient ->
+      # PortalApi -> PortalFn would be circular), and Cognito requires a callback
+      # when the code flow is enabled.
+      CallbackURLs:
+        - https://example.com/login/callback
+      LogoutURLs:
+        - https://example.com/
+
+  # HMAC key for the portal's signed session cookies (defense-in-depth; the real
+  # credential is always the IdP JWT, validated independently by the gateway).
+  PortalCookieSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}-portal-cookie-secret"
+      GenerateSecretString:
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  PortalApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: !Sub "${ProjectName} connections portal (public web UI)."
+
+  PortalFn:
+    Type: AWS::Serverless::Function
+    # Dynamic references don't create an implicit dependency; make it explicit.
+    DependsOn: PortalCookieSecret
+    Properties:
+      FunctionName: !Sub "${ProjectName}-portal"
+      Runtime: python3.12
+      Handler: app.handler
+      CodeUri: src/portal/
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          COGNITO_DOMAIN: !Sub "https://${ProjectName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
+          PORTAL_CLIENT_ID: !Ref PortalClient
+          GATEWAY_URL: !GetAtt Gateway.GatewayUrl
+          COOKIE_SECRET: !Sub "{{resolve:secretsmanager:${ProjectName}-portal-cookie-secret:SecretString}}"
+      Policies:
+        - Statement:
+            - Sid: FinalizeUserTokenBinding
+              Effect: Allow
+              Action: bedrock-agentcore:CompleteResourceTokenAuth
+              Resource:
+                - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/*"
+                - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+            # Completion exchanges the OAuth code, so it reads the provider's client
+            # secret from the identity vault (same grant the gateway role has).
+            - Sid: ReadProviderSecrets
+              Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!*"
+      Events:
+        Home:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PortalApi
+            Path: /
+            Method: GET
+        Login:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PortalApi
+            Path: /login
+            Method: GET
+        LoginCallback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PortalApi
+            Path: /login/callback
+            Method: GET
+        Logout:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PortalApi
+            Path: /logout
+            Method: GET
+        Connect:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PortalApi
+            Path: "/connect/{provider}"
+            Method: GET
+        ConnectCallback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PortalApi
+            Path: /connections/callback
+            Method: GET
+
+Outputs:
+  PortalUrl:
+    Description: Open this in a browser to onboard third-party (3LO) connections.
+    Value: !Sub "https://${PortalApi}.execute-api.${AWS::Region}.amazonaws.com"
+  PortalClientId:
+    Description: Cognito app client for the portal login; deploy.sh sets its callback URL.
+    Value: !Ref PortalClient
+  InternalApiUrl:
+    Description: Mock internal system base URL (IAM-authed; only the gateway role can call it).
+    Value: !Sub "https://${InternalHttpApi}.execute-api.${AWS::Region}.amazonaws.com/internal"
+  InterceptorArn:
+    Description: Interceptor Lambda ARN; scripts/attach-interceptor.sh wires it onto the gateway.
+    Value: !GetAtt InterceptorFn.Arn
+  GatewayUrl:
+    Description: MCP endpoint. Put this in .mcp.json; clients sign in via OAuth (no static token).
+    Value: !GetAtt Gateway.GatewayUrl
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Public OAuth client id. Safe to commit in .mcp.json as oauth.clientId.
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Description: Hosted login domain that serves the OAuth authorize/token endpoints.
+    Value: !Sub "https://${ProjectName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
+  AuthServerMetadataUrl:
+    Description: Put this in .mcp.json as oauth.authServerMetadataUrl (after running publish-oauth-metadata.sh).
+    Value: !Sub "https://${MetadataBucket.RegionalDomainName}/oauth-authorization-server.json"
+  DiscoveryUrl:
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration"
+  GithubCallbackUrl:
+    Description: Register this as the Authorization callback URL in your GitHub OAuth app.
+    Value: !GetAtt GithubOAuthProvider.CallbackUrl
